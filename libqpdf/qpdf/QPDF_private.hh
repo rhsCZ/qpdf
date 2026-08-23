@@ -647,6 +647,25 @@ class QPDF::Doc::Linearization: Common
   private:
     // Data structures to support optimization -- implemented in QPDF_optimization.cc
 
+    // The order of items in obj_category_e is strategic with lower values generally taking
+    // precedence over higher values. ObjCategory::update has the relevant logic.
+    enum obj_category_e {
+        c_root,
+        c_open_document,
+        c_first_page_shared,
+        c_first_page_private,
+        c_other_page_shared,
+        c_other_page_private,
+        c_thumbnail_shared,
+        c_thumbnail_private,
+        c_outlines_obj,
+        c_outlines,
+        c_pages_obj,
+        c_other,
+    };
+
+    class ObjCategory;
+
     class ObjUser
     {
       public:
@@ -664,9 +683,12 @@ class QPDF::Doc::Linearization: Common
         ObjUser(user_e type, std::string const& key);
 
         bool operator<(ObjUser const&) const;
+        /// @brief Return the linearization category this object would have if it were only
+        /// referenced in one place.
+        ObjCategory obj_category(bool top) const;
 
         user_e ou_type;
-        size_t pageno{0}; // if ou_page;
+        size_t pageno{0}; // if ou_page or ou_thumb
         std::string key;  // if ou_trailer_key or ou_root_key
     };
 
@@ -679,182 +701,44 @@ class QPDF::Doc::Linearization: Common
         bool top;
     };
 
-    // Forward declaration. Defined just below. addUserToStats is the single ingest path
-    // that records the fact that `ou` references the object whose stats are passed in;
-    // it's called both from updateObjectMaps (every indirect object reached by DFS) and
-    // from optimize_internal (the explicit /Root registration after page traversal).
-    class ObjUserStats;
-
-    // ===================================================================================
-    //
-    //  PATCH: bidirectional analysis maps for linearization
-    //  -----------------------------------------------------------
-    //
-    //  qpdf's linearization first walks the document to build two maps that describe
-    //  "what objects each page subtree uses" and "what users each object has". Vanilla
-    //  qpdf stores these as:
-    //
-    //    std::map<ObjUser, std::set<QPDFObjGen>>  obj_user_to_objects_;
-    //    std::map<QPDFObjGen, std::set<ObjUser>>  object_to_obj_users_;
-    //
-    //  On well-behaved PDFs that's fine. On supernode-heavy PDFs (typical Microsoft
-    //  Word-365 PDF export, tagged-PDF documents whose structure tree connects every
-    //  page to every annotation/marked-content endpoint), each of the ~N pages
-    //  transitively reaches ~M of the ~N+M total objects, so each map ends up with
-    //  O(N*M) entries. On a 1241-page / 77000-object tagged-PDF reference file this
-    //  reaches ~75 million entries in each map, with std::set<>'s ~96-byte-per-entry
-    //  red-black-tree overhead amounting to ~12 GB of resident memory. We could not
-    //  produce that file at all on a 32 GB workstation: two parallel linearization
-    //  jobs OOM the host.
-    //
-    //  Two observations enable a 17x memory cut without changing the linearization
-    //  algorithm at all (output is bit-for-bit identical to vanilla qpdf):
-    //
-    //  (1) obj_user_to_objects_: the set semantics are redundant.
-    //      updateObjectMaps already maintains a per-call local `visited` set so it
-    //      never asks us to insert the same og twice for the same ou. The std::set
-    //      was paying ~48 bytes of red-black-tree overhead per element to deduplicate
-    //      something that's already deduplicated upstream. We replace it with a
-    //      std::vector<QPDFObjGen> (push_back, no per-element overhead) and sort
-    //      each vector once at the end of optimize_internal to preserve the
-    //      sorted-iteration order downstream code depends on.
-    //
-    //  (2) object_to_obj_users_: the set values are never iterated, only summarised.
-    //      The downstream consumers in calculateLinearizationData ask exactly the
-    //      questions encoded in the ObjUserStats struct below: "is page 0 a user?",
-    //      "is exactly one non-first page a user, or many?", "any thumb users?",
-    //      "any non-special trailer/root-key user?". They never need the explicit
-    //      ObjUser list. We collapse the std::set<ObjUser> (~96 bytes per entry)
-    //      into a 12-byte ObjUserStats whose size is bounded regardless of how
-    //      many pages share the object. On the reference file this drops the
-    //      object_to_obj_users_ footprint from ~6-7 GB to under 1 MB.
-    //
-    //  The struct intentionally tracks "first other_pageno + has-more flag" rather
-    //  than a raw counter so we don't over-count when one page reaches an object
-    //  twice through different paths (e.g. /Resources -> /Font -> /Encoding vs
-    //  /Resources -> /Font -> /ToUnicode), which would otherwise change the
-    //  categorisation boundary between "private to one page" (part 7) and "shared
-    //  by multiple pages" (part 8) and produce a structurally different output.
-    //
-    // ===================================================================================
-    class ObjUserStats
+    class ObjCategory
     {
       public:
-        /// @brief Record that an ObjUser references this object.
+        /// @brief Record and incrementally update an object's linearization category.
         ///
-        /// Updates the internal statistics bits and counters that summarize  categories of users
-        /// reference the object. This includes marking whether the object is referenced from the
-        /// first page, outlines, the document root, open-document keys, other document-level keys,
-        /// thumbnail users, and tracking the first seen non-zero page/thumb and whether more than
-        /// one such page/thumb has been observed.
-        ///
-        /// This method is the single ingest path used by updateObjectMaps and optimize_internal to
-        /// record that `ou` references the object.
+        /// In a linearized PDF, objects belong to one of several parts, and within the parts,
+        /// objects are ordered in a particular way. This type allows us to determine exactly
+        /// where an object will end up such that, within each category, we just have to sort by
+        /// object number.
         ///
         /// @param ou  The ObjUser indicating the user and context that referenced the object.
-        void add(ObjUser const& ou);
-
-        // True if the object has more than one logical user across all ObjUser
-        // categories. Replaces the old `set.size() > 1` check that ran inside the
-        // shared-object hint-table builder. The count here over-approximates only
-        // when the same object would have appeared in the old set under multiple
-        // distinct "other" trailer/root keys (collapsed to a single `in_others`
-        // bit); since `is_shared` is used purely as a boolean predicate in the
-        // surviving consumer and the "shared" categorisation already triggers on
-        // any count >= 2, this collapse is observationally equivalent.
-        bool
-        is_shared() const
+        void update(ObjCategory const& other);
+        ObjCategory() = default;
+        ObjCategory(obj_category_e category, int pageno) :
+            lin_category_(category),
+            pageno_(pageno)
         {
-            int count = (in_first_page_ ? 1 : 0) + (is_root_ ? 1 : 0) + (in_outlines_ ? 1 : 0) +
-                (in_open_document_ ? 1 : 0) + (in_others_ ? 1 : 0);
-            if (first_other_pageno_ != -1) {
-                count += more_than_one_other_page_ ? 2 : 1;
-            }
-            if (first_thumb_pageno_ != -1) {
-                count += more_than_one_thumb_ ? 2 : 1;
-            }
-            return count > 1;
         }
 
-        // Take another stats record and OR/merge it into this one. Used by
-        // filterCompressedObjects when multiple original objects collapse onto
-        // a single containing-object-stream key: their stats have to be merged
-        // before the originals are dropped.
-        void
-        merge_from(ObjUserStats const& o)
+        inline obj_category_e
+        category() const
         {
-            in_first_page_ = in_first_page_ || o.in_first_page_;
-            in_outlines_ = in_outlines_ || o.in_outlines_;
-            is_root_ = is_root_ || o.is_root_;
-            in_open_document_ = in_open_document_ || o.in_open_document_;
-            in_others_ = in_others_ || o.in_others_;
-            if (o.more_than_one_other_page_) {
-                more_than_one_other_page_ = true;
-            } else if (o.first_other_pageno_ != -1) {
-                add_page(o.first_other_pageno_);
-            }
-            if (o.more_than_one_thumb_) {
-                more_than_one_thumb_ = true;
-            } else if (o.first_thumb_pageno_ != -1) {
-                add_thumb(o.first_thumb_pageno_);
-            }
+            return lin_category_;
+        }
+        inline int
+        pageno() const
+        {
+            return pageno_;
         }
 
       private:
-        // Record that ou_page with this pageno referenced the object.
-        // Page 0 is tracked as its own boolean (the linearization spec singles
-        // out the first page).
-        void
-        add_page(int pageno)
-        {
-            if (pageno == 0) {
-                in_first_page_ = true;
-                return;
-            }
-            if (first_other_pageno_ == -1) {
-                first_other_pageno_ = pageno;
-            } else if (first_other_pageno_ != pageno) {
-                more_than_one_other_page_ = true;
-            }
-        }
-
-        // Same scheme for thumbnail user references.
-        void
-        add_thumb(int pageno)
-        {
-            if (first_thumb_pageno_ == -1) {
-                first_thumb_pageno_ = pageno;
-            } else if (first_thumb_pageno_ != pageno) {
-                more_than_one_thumb_ = true;
-            }
-        }
-
-      public: // TODO: make data members private
-        // Set true if ou_page with pageno == 0 ever references the object.
-        bool in_first_page_{false};
-        // Set true if ou_root_key with key == "/Outlines" ever references the object.
-        bool in_outlines_{false};
-        // Set true if ou_root (the document catalog itself) references the object.
-        bool is_root_{false};
-        // Set true if ou_trailer_key == "/Encrypt" OR ou_root_key in the
-        // open_document_keys_ set ("/ViewerPreferences", "/PageMode", "/Threads",
-        // "/OpenAction", "/AcroForm") ever references the object.
-        bool in_open_document_{false};
-        // Set true if any "other" trailer-key or root-key (i.e. not one of the
-        // special ones above, e.g. "/Pages", "/StructTreeRoot", "/Names") references
-        // the object. A single bool is enough: the consumer only checks
-        // "did any non-special doc-level key touch this".
-        bool in_others_{false};
-        // The first non-zero page number that referenced the object, or -1.
-        // Together with `more_than_one_other_page` this distinguishes
-        // "exactly one other page" from "many other pages" without storing
-        // the full set.
-        int first_other_pageno_{-1};
-        // Set true once we see a SECOND distinct non-zero page number.
-        bool more_than_one_other_page_{false};
-        // Same scheme for ou_thumb references.
-        int first_thumb_pageno_{-1};
-        bool more_than_one_thumb_{false};
+        obj_category_e lin_category_{c_other};
+        // pageno_ is -1 if not referenced by a page, 0 if referenced by only the first page, and
+        // > 0 if referenced by multiple pages. Once the object is known to be referenced by
+        // multiple pages, the value of pageno_ is no longer relevant. We just need to hang onto
+        // at least one value so we can tell the difference between objects that are private to a
+        // page and objects that are shared by multiple pages.
+        int pageno_{-1};
     };
 
     // PDF 1.4: Table F.4
@@ -1012,11 +896,6 @@ class QPDF::Doc::Linearization: Common
     qpdf_offset_t adjusted_offset(qpdf_offset_t offset);
     template <typename T>
     void calculateLinearizationData(T const& object_stream_data);
-    template <typename T>
-    void pushOutlinesToPart(
-        std::vector<QPDFObjectHandle>& part,
-        std::set<QPDFObjGen>& lc_outlines,
-        T const& object_stream_data);
     int outputLengthNextN(
         int in_object,
         int n,
@@ -1040,16 +919,8 @@ class QPDF::Doc::Linearization: Common
     void filterCompressedObjects(std::map<int, int> const& object_stream_data);
     void filterCompressedObjects(QPDFWriter::ObjTable const& object_stream_data);
 
-    // CHANGE (1): per-ou object list, std::set<QPDFObjGen> -> std::vector<QPDFObjGen>.
-    // updateObjectMaps's local `visited` set already deduplicates within a single
-    // call, so we just push_back. We sort each vector at the end of
-    // optimize_internal so downstream consumers iterate in QPDFObjGen order
-    // (the same order the old std::set provided).
     std::map<ObjUser, std::vector<QPDFObjGen>> obj_user_to_objects_;
-
-    // CHANGE (2): per-object user list, std::set<ObjUser> -> ObjUserStats. See the
-    // long comment block above for the rationale and correctness argument.
-    std::map<QPDFObjGen, ObjUserStats> object_to_obj_users_;
+    std::map<QPDFObjGen, ObjCategory> obj_categories_;
 
     // Linearization data
     bool linearization_warnings_{false}; // set by linearizationWarning, used by checkLinearization

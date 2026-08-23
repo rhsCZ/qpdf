@@ -69,6 +69,13 @@ load_vector_vector(
     bit_stream.skipToNextByte();
 }
 
+template <class T>
+static void
+append_vec(std::vector<T>& v1, std::vector<T>&& v2)
+{
+    v1.insert(v1.end(), std::make_move_iterator(v2.begin()), std::make_move_iterator(v2.end()));
+}
+
 Lin::ObjUser::ObjUser(user_e type) :
     ou_type(type)
 {
@@ -104,6 +111,44 @@ Lin::ObjUser::operator<(ObjUser const& rhs) const
         }
     }
     return false;
+}
+
+// @brief:
+Lin::ObjCategory
+Lin::ObjUser::obj_category(bool top) const
+{
+    switch (ou_type) {
+    case ObjUser::ou_page:
+        if (pageno == 0) {
+            return {c_first_page_private, util::to<int>(pageno)};
+        }
+        return {c_other_page_private, util::to<int>(pageno)};
+    case ObjUser::ou_thumb:
+        return {c_thumbnail_private, util::to<int>(pageno)};
+    case ObjUser::ou_root:
+        return {c_root, -1};
+    case ObjUser::ou_root_key:
+        if (key == "/ViewerPreferences" || key == "/PageMode" || key == "/Threads" ||
+            key == "/OpenAction" || key == "/AcroForm") {
+            return {c_open_document, -1};
+        }
+        if (key == "/Outlines") {
+            if (top) {
+                return {c_outlines_obj, -1};
+            }
+            return {c_outlines, -1};
+        }
+        if (key == "/Pages") {
+            return {c_pages_obj, -1};
+        }
+        return {c_other, -1};
+    case ObjUser::ou_trailer_key:
+        if (key == "/Encrypt") {
+            return {c_open_document, -1};
+        }
+        return {c_other, -1};
+    }
+    return {c_other, -1};
 }
 
 Lin::UpdateObjectMapsFrame::UpdateObjectMapsFrame(
@@ -199,21 +244,11 @@ Lin::optimize_internal(
 
     ObjUser root_ou = ObjUser(ObjUser::ou_root);
     auto root_og = root.id_gen();
-    // PATCH (1): push_back into a vector instead of .insert into a set.
     obj_user_to_objects_[root_ou].push_back(root_og);
-    // PATCH (2): merge this user into the object's stats record instead of
-    // .insert into a set<ObjUser>.
-    object_to_obj_users_[root_og].add(root_ou);
+    obj_categories_[root_og].update(root_ou.obj_category(true));
 
-    // PATCH (1): With vector-of-QPDFObjGen replacing set-of-QPDFObjGen we lose
-    // the inherent sorted iteration order. Downstream consumers (calculateLinearizationData
-    // shared-object placement, part 7 ordering) iterate per-ou and rely on stable,
-    // deterministic order to keep output byte-identical to vanilla qpdf. We restore
-    // that by sorting each per-ou vector exactly once now that all page/trailer/root-key
-    // traversals are complete. Each (ou, og) pair was inserted at most once (the local
-    // `visited` set in updateObjectMaps guarantees no duplicates within a call, and
-    // each ou is only visited by one call to updateObjectMaps), so no dedup is needed
-    // here.
+    // Sort each collection by ObjGen to ensure a deterministic order when we iterate through these
+    // for final object categorization.
     for (auto& [ou, ogs]: obj_user_to_objects_) {
         std::sort(ogs.begin(), ogs.end());
     }
@@ -221,43 +256,64 @@ Lin::optimize_internal(
     filterCompressedObjects(object_stream_data);
 }
 
-// PATCH (2): the single ingest point for object_to_obj_users_. Vanilla qpdf
-// inserted `ou` into a std::set<ObjUser> here; we instead OR/merge its
-// significance into the fixed-size ObjUserStats slot. The branch structure
-// mirrors the switch statement the old categorisation pass used to run inside
-// calculateLinearizationData — that pass is now a straight read of the
-// already-classified flags.
 void
-Lin::ObjUserStats::add(ObjUser const& ou)
+Lin::ObjCategory::update(ObjCategory const& other)
 {
-    switch (ou.ou_type) {
-    case ObjUser::ou_page:
-        add_page(static_cast<int>(ou.pageno));
-        break;
-    case ObjUser::ou_thumb:
-        add_thumb(static_cast<int>(ou.pageno));
-        break;
-    case ObjUser::ou_root:
-        is_root_ = true;
-        break;
-    case ObjUser::ou_root_key:
-        if (ou.key == "/ViewerPreferences" || ou.key == "/PageMode" || ou.key == "/Threads" ||
-            ou.key == "/OpenAction" || ou.key == "/AcroForm") {
-            in_open_document_ = true;
-        } else if (ou.key == "/Outlines") {
-            in_outlines_ = true;
-        } else {
-            in_others_ = true;
-        }
-        break;
-    case ObjUser::ou_trailer_key:
-        if (ou.key == "/Encrypt") {
-            in_open_document_ = true;
-        } else {
-            in_others_ = true;
-        }
-        break;
+    // Figure out what category this should be when combined with `other`. Earlier parts take
+    // precedent over later parts. This logic is non-trivial for objects that are referenced from
+    // more than one category. For example, if an object is referenced by the first page and the
+    // root, it goes in the root category. If it's accessed from a non-first page and a first page,
+    // it belongs in a first page category. This is only part of the logic. See remaining comments.
+    auto min_category = std::ranges::min(lin_category_, other.lin_category_);
+    auto max_category = std::ranges::max(lin_category_, other.lin_category_);
+    if (min_category <= c_first_page_shared) {
+        // If either item is in part 4 or known to be referenced from the first page and at least
+        // one other page, keep it in the highest priority of the values.
+        lin_category_ = min_category;
+        return;
     }
+    if (min_category == c_first_page_private) {
+        if (max_category == c_other_page_private || max_category == c_other_page_shared) {
+            // We know this is referenced by the first page and at least one other page.
+            lin_category_ = c_first_page_shared;
+        }
+        // Whatever the max category is, if the object is referenced by the first page, we need to
+        // insure it ends up in part 6 (unless it was already placed in part 4).
+        lin_category_ = c_first_page_private;
+        return;
+    }
+    if (min_category == c_other_page_shared) {
+        // This is already known to be accessed by multiple non-first pages.
+        lin_category_ = c_other_page_shared;
+        return;
+    }
+    if (min_category == c_other_page_private) {
+        if (max_category == c_other_page_private && pageno_ != other.pageno_) {
+            // This is now known to be referenced from multiple pages. The value of pageno_
+            // no longer matters.
+            lin_category_ = c_other_page_shared;
+        } else {
+            lin_category_ = c_other_page_private;
+            pageno_ = other.pageno_;
+        }
+        return;
+    }
+    // Thumbnail logic mirrors page logic
+    if (min_category == c_thumbnail_shared) {
+        lin_category_ = c_thumbnail_shared;
+        return;
+    }
+    if (min_category == c_thumbnail_private) {
+        if (max_category == c_thumbnail_private && pageno_ != other.pageno_) {
+            lin_category_ = c_thumbnail_shared;
+        } else {
+            lin_category_ = c_thumbnail_private;
+            pageno_ = other.pageno_;
+        }
+        return;
+    }
+    // All that remains is outlines and other. Keep whichever is highest priority.
+    lin_category_ = min_category;
 }
 
 void
@@ -290,31 +346,14 @@ Lin::updateObjectMaps(
                 QTC::TC("qpdf", "QPDF opt loop detected");
                 continue;
             }
-            // PATCH: the two analysis maps are updated here, once per
-            // (ou, og) pair, on each indirect object we reach during DFS from
-            // the entry-point ObjUser (a page, a thumb, a trailer-key, or a
-            // root-key).
-            //
-            // (1) obj_user_to_objects_[cur.ou] is std::vector<QPDFObjGen> in
-            //     this patch (was std::set<QPDFObjGen>). The local `visited`
-            //     QPDFObjGen::set above already prevents us from inserting the
-            //     same og twice for this ou (the only place where the same ou
-            //     enters this function is the single outer call site), so we
-            //     can push_back without paying for set deduplication.
-            //
-            // (2) object_to_obj_users_[og] is std::map<QPDFObjGen, ObjUserStats>
-            //     in this patch (was std::map<QPDFObjGen, std::set<ObjUser>>).
-            //     Instead of inserting a copy of `cur.ou` into a per-object set,
-            //     we just OR/merge the relevant flags+counters into the
-            //     fixed-size ObjUserStats slot. operator[] default-constructs
-            //     a zero-initialised ObjUserStats if og is new to the map,
-            //     which is the correct identity element for the merge.
             if (cur.ou.ou_type == ObjUser::ou_page || cur.ou.ou_type == ObjUser::ou_thumb ||
                 (cur.ou.ou_type == ObjUser::ou_root_key &&
                  (cur.ou.key == "/Pages" || cur.ou.key == "/Outlines"))) {
+                // QXXXQ Do I even need obj_user_to_objects_?
                 obj_user_to_objects_[cur.ou].push_back(og);
             }
-            object_to_obj_users_[og].add(cur.ou);
+            // QXXXQ can we resolve the object's object stream owner here?
+            obj_categories_[og].update(cur.ou.obj_category(cur.top));
         }
 
         if (cur.oh.isArray()) {
@@ -359,6 +398,8 @@ Lin::updateObjectMaps(
 void
 Lin::filterCompressedObjects(std::map<int, int> const& object_stream_data)
 {
+    // QXXXQ can we eliminate this entirely by just working with the containing object stream
+    // when we build obj_user_to_objects_ and obj_categories_?
     if (object_stream_data.empty()) {
         return;
     }
@@ -366,35 +407,6 @@ Lin::filterCompressedObjects(std::map<int, int> const& object_stream_data)
     // Transform object_to_obj_users and obj_user_to_objects so that they refer only to uncompressed
     // objects.  If something is a user of a compressed object, then it is really a user of the
     // object stream that contains it.
-    //
-    // ============================================================================
-    // PATCH (3): in-place rewrite of obj_user_to_objects_
-    // ----------------------------------------------------------------------------
-    // Vanilla qpdf built two parallel temporary maps
-    //   std::map<ObjUser, std::set<QPDFObjGen>> t_obj_user_to_objects;
-    //   std::map<QPDFObjGen, std::set<ObjUser>> t_object_to_obj_users;
-    // populated them by iterating the originals, then std::move-assigned both
-    // over the member maps. During the populate step BOTH the source and the
-    // destination map were live in memory; on the reference 21 MB / 1241-page
-    // file this transiently doubled working set by ~600 MB (~1.0 GB -> ~1.6 GB)
-    // before snapping back, on top of an already 17x reduction from changes (1)
-    // and (2). The doubled state is observable as a peak that 2-files-in-parallel
-    // would amplify (two simultaneous spikes).
-    //
-    // Rewriting in place is safe because the transform on each (ou, ogs) entry
-    // is independent of every other entry: each og maps deterministically to
-    // either itself or the og of its containing object stream, and we don't
-    // need to look at any other entry to make that decision. We can therefore
-    // walk the existing map and mutate each vector in place. The only complication
-    // is that multiple distinct ogs in a given page's vector can collapse onto
-    // the same target (the containing stream's og) after translation; we handle
-    // that with a terminal sort+unique pass on each vector, the same way the old
-    // parallel-map approach implicitly deduplicated via std::set::insert.
-    //
-    // Peak working set during this step is now bounded by one rewritten vector
-    // at a time (a few hundred KB) plus the original map, instead of two full
-    // copies of the original map.
-    // ============================================================================
     for (auto& [ou, ogs]: obj_user_to_objects_) {
         for (auto& og: ogs) {
             auto i2 = object_stream_data.find(og.getObj());
@@ -406,84 +418,30 @@ Lin::filterCompressedObjects(std::map<int, int> const& object_stream_data)
         ogs.erase(std::unique(ogs.begin(), ogs.end()), ogs.end());
     }
 
-    // ============================================================================
-    // PATCH (4): in-place rewrite of object_to_obj_users_
-    // ----------------------------------------------------------------------------
-    // Same idea as change (3), but the destination key is what's changing (the
-    // og becomes the stream's og), not the value. Multiple source ogs can
-    // collapse onto a single target og, so the transform is logically a merge.
-    //
-    // We can't safely iterate the map and erase+insert in the same loop:
-    // inserting at `target` may invalidate iterators in some std::map
-    // implementations if target happens to hash/sort near the cursor, and even
-    // when it doesn't, erasing the current entry and then inserting a new one
-    // with a new key would tangle the iteration. So we do two passes:
-    //
-    //   Pass 1 (read-only): gather a list of (from, to) translations.
-    //   Pass 2 (mutate):    for each translation, take the stats out of the
-    //                       source entry, erase the source entry, and merge
-    //                       those stats into the target entry's stats.
-    //
-    // ObjUserStats::merge_from is a logical OR/sum across all fields, with
-    // bounded counters that saturate to "many" — it's idempotent under
-    // repeated application, so even if the from-entry was already merged
-    // (e.g. several originals collapsing onto the same target) the result is
-    // still correct.
-    //
-    // Peak working set during this step is now bounded by the size of the
-    // (from, to) translations vector (just two 64-bit ints per compressed
-    // object — a few MB at most for the reference file), instead of a full
-    // duplicate of object_to_obj_users_.
-    // ============================================================================
-    std::vector<std::pair<QPDFObjGen, QPDFObjGen>> moves; // (from, to)
-    for (auto const& [og, _]: object_to_obj_users_) {
+    // Make sure the object category for each object stream is the union of the categories of the
+    // objects in the stream. Then remove the compressed objects from the maps.
+    std::vector<QPDFObjGen> to_delete;
+    for (auto const& [og, category]: obj_categories_) {
         auto i2 = object_stream_data.find(og.getObj());
         if (i2 != object_stream_data.end()) {
             QPDFObjGen target(i2->second, 0);
-            if (target != og) {
-                moves.emplace_back(og, target);
-            }
+            obj_categories_[target].update(category);
+            to_delete.emplace_back(og);
         }
     }
-    for (auto const& [from, to]: moves) {
-        auto it = object_to_obj_users_.find(from);
-        if (it == object_to_obj_users_.end()) {
-            continue; // already merged in a prior step
-        }
-        ObjUserStats stats = std::move(it->second);
-        object_to_obj_users_.erase(it);
-        object_to_obj_users_[to].merge_from(stats);
+    for (auto og: to_delete) {
+        obj_categories_.erase(og);
     }
 }
 
 void
 Lin::filterCompressedObjects(QPDFWriter::ObjTable const& obj)
 {
+    // QXXXQ can we eliminate this entirely by just working with the containing object stream
+    // when we build obj_user_to_objects_ and obj_categories_?
     if (obj.getStreamsEmpty()) {
         return;
     }
-
-    // PATCH (3) and (4): see the long comment blocks on the std::map<int,int>
-    // overload above. This overload does the same in-place transform, with two
-    // additional wrinkles:
-    //   * The data source is QPDFWriter::ObjTable (the writer's per-object state)
-    //     instead of a plain int->int map. Per-og translation goes through
-    //     obj[og].object_stream rather than a map lookup.
-
-    // The following comment is incorrect. The ObjTable will be populated with the result of the
-    // linearization step, and all objects returned in the parts vectors will be written. At this
-    // point the table contains empty slots for objects that we reasonably expect to write plus
-    // all compressed objects. If we find objects during linearization with unexpected object ids,
-    // they will be added later. (contains only tells us that there is a valid slot that can be
-    // queried)
-
-    //   * Ogs that aren't present in the writer's ObjTable at all are dropped
-    //     entirely (the writer doesn't intend to emit them). In the source
-    //     vector this means compacting the live entries with an out-pointer
-    //     instead of replacing every entry in place; in the destination map it
-    //     means an explicit erase pass.
-
-    // Change (3): rewrite obj_user_to_objects_ vectors in place, compact-then-sort+unique.
     for (auto& [ou, ogs]: obj_user_to_objects_) {
         for (auto& og: ogs) {
             if (auto i2 = obj.contains(og) ? obj[og].object_stream : 0) {
@@ -494,10 +452,8 @@ Lin::filterCompressedObjects(QPDFWriter::ObjTable const& obj)
         ogs.erase(std::unique(ogs.begin(), ogs.end()), ogs.end());
     }
 
-    // Change (4): collect (from, to) translations + the drop-list in one read-only
-    // pass over the map, then apply them.
-    std::vector<std::pair<QPDFObjGen, QPDFObjGen>> moves; // (from, to)
-    for (auto const& [og, _]: object_to_obj_users_) {
+    std::vector<QPDFObjGen> to_delete;
+    for (auto const& [og, category]: obj_categories_) {
         if (!obj.contains(og)) {
             continue;
         }
@@ -505,18 +461,13 @@ Lin::filterCompressedObjects(QPDFWriter::ObjTable const& obj)
         if (i2 > 0) {
             QPDFObjGen target(i2, 0);
             if (target != og) {
-                moves.emplace_back(og, target);
+                obj_categories_[target].update(category);
+                to_delete.emplace_back(og);
             }
         }
     }
-    for (auto const& [from, to]: moves) {
-        auto it = object_to_obj_users_.find(from);
-        if (it == object_to_obj_users_.end()) {
-            continue;
-        }
-        ObjUserStats stats = std::move(it->second);
-        object_to_obj_users_.erase(it);
-        object_to_obj_users_[to].merge_from(stats);
+    for (auto og: to_delete) {
+        obj_categories_.erase(og);
     }
 }
 
@@ -1431,7 +1382,7 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     // actual offsets and lengths are not computed here, but anything related to object ordering is.
 
     util::assertion(
-        !object_to_obj_users_.empty(),
+        !obj_categories_.empty(),
         "INTERNAL ERROR: QPDF::calculateLinearizationData called before optimize()" //
     );
     // Note that we can't call optimize here because we don't know whether it should be called
@@ -1456,35 +1407,61 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     // Part 7 contains remaining objects private to pages other than the first page.
 
     // Part 8 contains all remaining shared objects except those that are shared only within
-    // thumbnails.
+    // thumbnails. "Shared objects" means objects referenced by more than one page.
 
     // Part 9 contains all remaining objects.
 
     // We sort objects into the following categories:
-
+    //   * document catalog: part 4
     //   * open_document: part 4
-
     //   * first_page_private: part 6
-
     //   * first_page_shared: part 6
-
     //   * other_page_private: part 7
-
     //   * other_page_shared: part 8
-
     //   * thumbnail_private: part 9
-
     //   * thumbnail_shared: part 9
-
     //   * other: part 9
-
     //   * outlines: part 6 or 9
 
-    part4_.clear();
-    part6_.clear();
-    part7_.clear();
-    part8_.clear();
-    part9_.clear();
+    // Each part is further subdivided into regions. Create a separate vector for each subpart,
+    // then merge. Directly add the things that go to the beginning of the part in the final vector
+    // to avoid any extra moves.
+
+    std::vector<QPDFObjectHandle> uc_pages;
+    std::vector<QPDFObjGen> uc_page_ogs;
+    std::vector<QPDFObjectHandle> uc_thumbs;
+    std::vector<QPDFObjGen> thumb_ogs;
+    { // local scope
+        // Map all page objects to the containing object stream.  This should be a no-op in a
+        // properly linearized file.
+        for (auto oh: pages) {
+            auto uc = getUncompressedObject(oh, object_stream_data);
+            uc_page_ogs.emplace_back(uc.getObjGen());
+            QPDFObjectHandle thumb = uc.getKey("/Thumb");
+            thumb = getUncompressedObject(thumb, object_stream_data);
+            thumb_ogs.emplace_back(thumb.getObjGen());
+            uc_pages.emplace_back(uc);
+            uc_thumbs.emplace_back(thumb);
+        }
+    }
+    size_t npages = pages.size();
+
+    part4_.clear(); // root
+    std::vector<QPDFObjectHandle> part4a_open_document;
+    part6_.clear(); // first page
+    std::vector<QPDFObjectHandle> part6a_first_page_private;
+    std::vector<QPDFObjectHandle> part6b_first_page_shared;
+    part7_.clear(); // other page private
+    std::vector<std::vector<QPDFObjectHandle>> part7a_page_objects(npages);
+    std::vector<std::vector<QPDFObjectHandle>> part7b_other_page_private(npages);
+    part8_.clear(); // other page shared
+    part9_.clear(); // starts with pages objects
+    std::vector<std::vector<QPDFObjectHandle>> part9a_thumbnail_objects(npages);
+    std::vector<std::vector<QPDFObjectHandle>> part9b_thumbnail_private(npages);
+    std::vector<QPDFObjectHandle> part9c_thumbnail_shared;
+    std::vector<QPDFObjectHandle> part9e_other;
+    std::vector<QPDFObjectHandle> part_outlines_obj;
+    std::vector<QPDFObjectHandle> part_outlines;
     c_linp_ = LinParameters();
     c_page_offset_data_ = CHPageOffset();
     c_shared_object_data_ = CHSharedObject();
@@ -1505,95 +1482,6 @@ Lin::calculateLinearizationData(T const& object_stream_data)
         QTC::TC("qpdf", "QPDF categorize pagemode outlines", outlines_in_first_page ? 1 : 0);
     }
 
-    std::set<QPDFObjGen> lc_open_document;
-    std::set<QPDFObjGen> lc_first_page_private;
-    std::set<QPDFObjGen> lc_first_page_shared;
-    std::set<QPDFObjGen> lc_other_page_private;
-    std::set<QPDFObjGen> lc_other_page_shared;
-    std::set<QPDFObjGen> lc_thumbnail_private;
-    std::set<QPDFObjGen> lc_thumbnail_shared;
-    std::set<QPDFObjGen> lc_other;
-    std::set<QPDFObjGen> lc_outlines;
-    std::set<QPDFObjGen> lc_root;
-
-    // PATCH (2): vanilla qpdf computed these locals by iterating an inner
-    // std::set<ObjUser> for each object and switching on ou_type. We now read
-    // them directly from the ObjUserStats slot, which was populated incrementally
-    // during the page-traversal pass (see updateObjectMaps + addUserToStats).
-    // The categorisation branches that consume these locals are unchanged from
-    // upstream — the conditions are expressed identically.
-    for (auto& [og, stats]: object_to_obj_users_) {
-        bool const in_open_document = stats.in_open_document_;
-        bool const in_first_page = stats.in_first_page_;
-        bool const in_outlines = stats.in_outlines_;
-        bool const is_root = stats.is_root_;
-        bool const has_other_pages = stats.first_other_pageno_ != -1;
-        bool const exactly_one_other_page = has_other_pages && !stats.more_than_one_other_page_;
-        bool const many_other_pages = stats.more_than_one_other_page_;
-        bool const has_thumbs = stats.first_thumb_pageno_ != -1;
-        bool const exactly_one_thumb = has_thumbs && !stats.more_than_one_thumb_;
-        bool const many_thumbs = stats.more_than_one_thumb_;
-        bool const has_others = stats.in_others_;
-
-        if (is_root) {
-            lc_root.insert(og);
-        } else if (in_outlines) {
-            lc_outlines.insert(og);
-        } else if (in_open_document) {
-            lc_open_document.insert(og);
-        } else if (in_first_page && !has_others && !has_other_pages && !has_thumbs) {
-            // This is essentially in_first_page && !shared
-            lc_first_page_private.insert(og);
-        } else if (in_first_page) {
-            lc_first_page_shared.insert(og);
-        } else if (exactly_one_other_page && !has_others && !has_thumbs) {
-            // This is essentially has_other_pages && !shared
-            lc_other_page_private.insert(og);
-        } else if (many_other_pages) {
-            // This correctly reproduces qpdf's existing behavior, but is wrong. If the object
-            // passes '(exactly_one_other_page && (has_others || has_thumbs))' it is written to
-            // part 9, breaking linearization for this page. This should be 'has_other_pages'
-            lc_other_page_shared.insert(og);
-        } else if (exactly_one_thumb && !has_others) {
-            // This is essentially has_thumbs && !shared
-            lc_thumbnail_private.insert(og);
-        } else if (many_thumbs) {
-            // Similarly to other_pages, this should simply be has_thumbs
-            lc_thumbnail_shared.insert(og);
-        } else {
-            lc_other.insert(og);
-        }
-        // The above tests essentially establish a strict order
-        //   is_root > in_outlines > .. > has_thumbs > is_other > uninit
-        // and we only require the maximum of these values and shared. The only other information we
-        // require to decide whether an object is shared is the page number, but only if the maximum
-        // value is other_pages or has_thumbs, and therefore only one page number is required, and
-        // only until we have established that the page is shared.
-        //
-        // This allows us to reduce the stats record to <= the size of 2 ints.
-        //
-        // Using this knowledge, adding an ObjUser or merging a compressed object into an object
-        // stream simplifies too:
-        //
-        // if stats.group == uninit:
-        //   stats.group = other.group
-        //   stats.page = other.page
-        //   return
-        // if !shared:
-        //   if stats.group == other.group && stats.page == other.page && !other.shared:
-        //     return
-        //   else:
-        //     shared = true
-        // if stats.group < other.group:
-        //   stats.group = other.group
-        //   stats.page = other page
-        //
-        // Given that object_to_obj_users_ and the various lc_... sets are all indexed by og, this
-        // will allow us in due course to completely dispense with the lc_... sets, eliminating
-        // the overhead of creating and destroying these sets, and in some cases, destroying the
-        // sets by deleting one element at a time.
-    }
-
     // Generate ordering for objects in the output file.  Sometimes we just dump right from a set
     // into a vector.  Rather than optimizing this by going straight into the vector, we'll leave
     // these phases separate for now.  That way, this section can be concerned only with ordering,
@@ -1603,17 +1491,79 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     // running calculateLinearizationData() on a linearized file should give results identical to
     // the original file ordering.
 
-    // We seem to traverse the page tree a lot in this code, but we can address this for a future
-    // code optimization if necessary. Premature optimization is the root of all evil.
-    std::vector<QPDFObjectHandle> uc_pages;
-    { // local scope
-        // Map all page objects to the containing object stream.  This should be a no-op in a
-        // properly linearized file.
-        for (auto oh: pages) {
-            uc_pages.emplace_back(getUncompressedObject(oh, object_stream_data));
+    for (auto& [og, category]: obj_categories_) {
+        auto oh = qpdf.getObject(og);
+        switch (category.category()) {
+        case c_root:
+            part4_.emplace_back(oh);
+            break;
+        case c_open_document:
+            part4a_open_document.emplace_back(oh);
+            break;
+        case c_first_page_shared:
+            part6b_first_page_shared.emplace_back(oh);
+            break;
+        case c_first_page_private:
+            if (og == uc_page_ogs.at(0)) {
+                part6_.emplace_back(uc_pages.at(0));
+            } else {
+                part6a_first_page_private.emplace_back(oh);
+            }
+            break;
+        case c_other_page_shared:
+            part8_.emplace_back(oh);
+            break;
+        case c_other_page_private:
+            {
+                size_t pageno = util::to<size_t>(category.pageno());
+                if (og == uc_page_ogs.at(pageno)) {
+                    part7a_page_objects.at(pageno).emplace_back(uc_pages.at(pageno));
+                } else {
+                    part7b_other_page_private.at(pageno).emplace_back(oh);
+                }
+            }
+            break;
+        case c_thumbnail_private:
+            {
+                size_t pageno = util::to<size_t>(category.pageno());
+                if (og == thumb_ogs.at(pageno)) {
+                    part9a_thumbnail_objects.at(pageno).emplace_back(uc_thumbs.at(pageno));
+                } else {
+                    part9b_thumbnail_private.at(pageno).emplace_back(oh);
+                }
+            }
+            break;
+        case c_thumbnail_shared:
+            part9c_thumbnail_shared.emplace_back(oh);
+            break;
+        case c_outlines_obj:
+            part_outlines_obj.emplace_back(oh);
+            break;
+        case c_outlines:
+            part_outlines.emplace_back(oh);
+            break;
+        case c_pages_obj:
+            part9_.emplace_back(oh);
+            break;
+        case c_other:
+            part9e_other.emplace_back(oh);
+            break;
         }
     }
-    size_t npages = pages.size();
+
+    std::set<QPDFObjGen> shared_ogs;
+    for (auto const& oh: part6b_first_page_shared) {
+        shared_ogs.insert(oh.getObjGen());
+    }
+    for (auto const& oh: part8_) {
+        shared_ogs.insert(oh.getObjGen());
+    }
+
+    if (!part_outlines.empty()) {
+        c_outline_data_.first_object = part_outlines.at(0).getObjectID();
+        c_outline_data_.nobjects = 1;
+    }
+    c_outline_data_.nobjects += toI(part_outlines.size());
 
     // We will be initializing some values of the computed hint tables.  Specifically, we can
     // initialize any items that deal with object numbers or counts but not any items that deal with
@@ -1629,44 +1579,26 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     // Part 4: open document objects.  We don't care about the order.
 
     no_ci_stop_if(
-        lc_root.size() != 1, "found other than one root while calculating linearization data" //
+        part4_.size() != 1, "found other than one root while calculating linearization data" //
     );
-
-    part4_.emplace_back(qpdf.getObject(*(lc_root.begin())));
-    for (auto const& og: lc_open_document) {
-        part4_.emplace_back(qpdf.getObject(og));
-    }
+    append_vec(part4_, std::move(part4a_open_document));
 
     // Part 6: first page objects.  Note: implementation note 124 states that Acrobat always treats
     // page 0 as the first page for linearization regardless of /OpenAction.  pdlin doesn't provide
     // any option to set this and also disregards /OpenAction.  We will do the same.
-
-    // First, place the actual first page object itself.
     no_ci_stop_if(
-        pages.empty(), "no pages found while calculating linearization data" //
+        part6_.size() != 1, "part 6 has other than exactly one object (first page dictionary)" //
     );
-    QPDFObjGen first_page_og(uc_pages.at(0).getObjGen());
-    no_ci_stop_if(
-        !lc_first_page_private.erase(first_page_og), "unable to linearize first page" //
-    );
-    c_linp_.first_page_object = uc_pages.at(0).getObjectID();
-    part6_.emplace_back(uc_pages.at(0));
-
     // The PDF spec "recommends" an order for the rest of the objects, but we are going to disregard
     // it except to the extent that it groups private and shared objects contiguously for the sake
     // of hint tables.
-
-    for (auto const& og: lc_first_page_private) {
-        part6_.emplace_back(qpdf.getObject(og));
-    }
-
-    for (auto const& og: lc_first_page_shared) {
-        part6_.emplace_back(qpdf.getObject(og));
-    }
+    append_vec(part6_, std::move(part6a_first_page_private));
+    append_vec(part6_, std::move(part6b_first_page_shared));
 
     // Place the outline dictionary if it goes in the first page section.
     if (outlines_in_first_page) {
-        pushOutlinesToPart(part6_, lc_outlines, object_stream_data);
+        append_vec(part6_, std::move(part_outlines_obj));
+        append_vec(part6_, std::move(part_outlines));
     }
 
     // Fill in page offset hint table information for the first page. The PDF spec says that
@@ -1680,46 +1612,20 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     // For each page in order:
     for (size_t i = 1; i < npages; ++i) {
         // Place this page's page object
-
-        QPDFObjGen page_og(uc_pages.at(i).getObjGen());
         no_ci_stop_if(
-            !lc_other_page_private.erase(page_og),
+            part7a_page_objects.at(i).size() != 1,
             "unable to linearize page " + std::to_string(i) //
         );
-
-        part7_.emplace_back(uc_pages.at(i));
+        append_vec(part7_, std::move(part7a_page_objects.at(i)));
 
         // Place all non-shared objects referenced by this page, updating the page object count for
         // the hint table.
-
-        c_page_offset_data_.entries.at(i).nobjects = 1;
-
-        ObjUser ou(ObjUser::ou_page, i);
-        no_ci_stop_if(
-            !obj_user_to_objects_.contains(ou),
-            "found unreferenced page while calculating linearization data" //
-        );
-
-        for (auto const& og: obj_user_to_objects_[ou]) {
-            if (lc_other_page_private.erase(og)) {
-                part7_.emplace_back(qpdf.getObject(og));
-                ++c_page_offset_data_.entries.at(i).nobjects;
-            }
-        }
+        c_page_offset_data_.entries.at(i).nobjects =
+            util::to<int>(1 + part7b_other_page_private.size());
+        append_vec(part7_, std::move(part7b_other_page_private.at(i)));
     }
-    // That should have covered all part7 objects.
-    util::assertion(
-        lc_other_page_private.empty(),
-        "INTERNAL ERROR: QPDF::calculateLinearizationData: lc_other_page_private is not empty "
-        "after generation of part7" //
-    );
 
-    // Part 8: other pages' shared objects
-
-    // Order is unimportant.
-    for (auto const& og: lc_other_page_shared) {
-        part8_.emplace_back(qpdf.getObject(og));
-    }
+    // Part 8: other pages' shared objects -- these were already appended
 
     // Part 9: other objects
 
@@ -1728,16 +1634,10 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     // page order, then shared thumbnail objects, and then outlines (unless in part 6).  After that,
     // we throw all remaining objects in arbitrary order.
 
-    // Place the pages tree.
-    auto& pages_ogs = obj_user_to_objects_[{ObjUser::ou_root_key, "/Pages"}];
+    // The pages tree is placed earlier.
     no_ci_stop_if(
-        pages_ogs.empty(), "found empty pages tree while calculating linearization data" //
+        part9_.empty(), "found empty pages tree while calculating linearization data" //
     );
-    for (auto const& og: pages_ogs) {
-        if (lc_other.erase(og)) {
-            part9_.emplace_back(qpdf.getObject(og));
-        }
-    }
 
     // Place private thumbnail images in page order.  Slightly more information would be required if
     // we were going to bother with thumbnail hint tables.
@@ -1746,46 +1646,26 @@ Lin::calculateLinearizationData(T const& object_stream_data)
         thumb = getUncompressedObject(thumb, object_stream_data);
         QPDFObjGen thumb_og(thumb.getObjGen());
         // Output the thumbnail itself
-        if (lc_thumbnail_private.erase(thumb_og) && !thumb.null()) {
-            part9_.emplace_back(thumb);
-        } else {
-            // No internal error this time...there's nothing to stop this object from having
-            // been referred to somewhere else outside of a page's /Thumb, and if it had been,
-            // there's nothing to prevent it from having been in some set other than
-            // lc_thumbnail_private.
-        }
-        for (auto const& og: obj_user_to_objects_[{ObjUser::ou_thumb, i}]) {
-            if (lc_thumbnail_private.erase(og)) {
-                part9_.emplace_back(qpdf.getObject(og));
-            }
-        }
+        append_vec(part9_, std::move(part9a_thumbnail_objects.at(i)));
+        append_vec(part9_, std::move(part9b_thumbnail_private.at(i)));
     }
-    util::assertion(
-        lc_thumbnail_private.empty(),
-        "INTERNAL ERROR: QPDF::calculateLinearizationData: lc_thumbnail_private not "
-        "empty after placing thumbnails" //
-    );
 
     // Place shared thumbnail objects
-    for (auto const& og: lc_thumbnail_shared) {
-        part9_.emplace_back(qpdf.getObject(og));
-    }
+    append_vec(part9_, std::move(part9c_thumbnail_shared));
 
     // Place outlines unless in first page
     if (!outlines_in_first_page) {
-        pushOutlinesToPart(part9_, lc_outlines, object_stream_data);
+        append_vec(part9_, std::move(part_outlines_obj));
+        append_vec(part9_, std::move(part_outlines));
     }
 
     // Place all remaining objects
-    for (auto const& og: lc_other) {
-        part9_.emplace_back(qpdf.getObject(og));
-    }
+    append_vec(part9_, std::move(part9e_other));
 
     // Make sure we got everything exactly once.
-
     size_t num_placed =
         part4_.size() + part6_.size() + part7_.size() + part8_.size() + part9_.size();
-    size_t num_wanted = object_to_obj_users_.size();
+    size_t num_wanted = obj_categories_.size();
     no_ci_stop_if(
         // This can happen with damaged files, e.g. if the root is part of the the pages tree.
         num_placed != num_wanted,
@@ -1840,56 +1720,13 @@ Lin::calculateLinearizationData(T const& object_stream_data)
             "found unreferenced page while calculating linearization data" //
         );
 
-        for (auto const& og: obj_user_to_objects_[ou]) {
-            // PATCH (2): vanilla qpdf consulted object_to_obj_users_[og].size() > 1
-            // here to ask "is this object shared by multiple users?". With the
-            // ObjUserStats representation we ask the same question via is_shared(),
-            // which returns true if more than one logical user (page 0, any other
-            // page, thumb, root, outlines, open-document key, or "other" key) ever
-            // touched the object. See the long comment on ObjUserStats::is_shared
-            // for the equivalence argument.
-            if (object_to_obj_users_[og].is_shared() && obj_to_index.contains(og.getObj())) {
+        for (auto const& og: shared_ogs) {
+            if (obj_to_index.contains(og.getObj())) {
                 int idx = obj_to_index[og.getObj()];
                 ++pe.nshared_objects;
                 pe.shared_identifiers.push_back(idx);
             }
         }
-    }
-}
-
-template <typename T>
-void
-Lin::pushOutlinesToPart(
-    std::vector<QPDFObjectHandle>& part,
-    std::set<QPDFObjGen>& lc_outlines,
-    T const& object_stream_data)
-{
-    QPDFObjectHandle root = qpdf.getRoot();
-    QPDFObjectHandle outlines = root.getKey("/Outlines");
-    if (outlines.null()) {
-        return;
-    }
-    outlines = getUncompressedObject(outlines, object_stream_data);
-    QPDFObjGen outlines_og(outlines.getObjGen());
-    QTC::TC(
-        "qpdf",
-        "QPDF lin outlines in part",
-        &part == &part6_         ? 0
-            : (&part == &part9_) ? 1
-                                 : 9999); // can't happen
-    if (lc_outlines.erase(outlines_og)) {
-        // Make sure outlines is in lc_outlines in case the file is damaged. in which case it may be
-        // included in an earlier part.
-        part.emplace_back(outlines);
-        c_outline_data_.first_object = outlines_og.getObj();
-        c_outline_data_.nobjects = 1;
-    }
-    for (auto const& og: lc_outlines) {
-        if (!c_outline_data_.first_object) {
-            c_outline_data_.first_object = og.getObj();
-        }
-        part.emplace_back(qpdf.getObject(og));
-        ++c_outline_data_.nobjects;
     }
 }
 
