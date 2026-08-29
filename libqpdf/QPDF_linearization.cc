@@ -290,6 +290,7 @@ Lin::ObjCategory::update(ObjUser const& other_ou, bool top)
         if (max_category == c_other_page_private || max_category == c_other_page_shared) {
             // We know this is referenced by the first page and at least one other page.
             lin_category_ = c_first_page_shared;
+            return;
         }
         // Whatever the max category is, if the object is referenced by the first page, we need to
         // insure it ends up in part 6 (unless it was already placed in part 4).
@@ -1443,6 +1444,7 @@ Lin::calculateLinearizationData(T const& object_stream_data)
         case c_first_page_private:
             if (og == uc_page_ogs.at(0)) {
                 part6_.emplace_back(uc_pages.at(0));
+                c_linp_.first_page_object = uc_pages.at(0).getObjectID();
             } else {
                 part6a_first_page_private.emplace_back(oh);
             }
@@ -1491,8 +1493,8 @@ Lin::calculateLinearizationData(T const& object_stream_data)
         }
     }
 
-    if (!part_outlines.empty()) {
-        c_outline_data_.first_object = part_outlines.at(0).getObjectID();
+    if (!part_outlines_obj.empty()) {
+        c_outline_data_.first_object = part_outlines_obj.at(0).getObjectID();
         c_outline_data_.nobjects = 1;
     }
     c_outline_data_.nobjects += toI(part_outlines.size());
@@ -1553,7 +1555,7 @@ Lin::calculateLinearizationData(T const& object_stream_data)
         // Place all non-shared objects referenced by this page, updating the page object count for
         // the hint table.
         c_page_offset_data_.entries.at(i).nobjects =
-            util::to<int>(1 + part7b_other_page_private.size());
+            util::to<int>(1 + part7b_other_page_private.at(i).size());
         append_vec(part7_, std::move(part7b_other_page_private.at(i)));
     }
 
@@ -1574,9 +1576,6 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     // Place private thumbnail images in page order.  Slightly more information would be required if
     // we were going to bother with thumbnail hint tables.
     for (size_t i = 0; i < npages; ++i) {
-        QPDFObjectHandle thumb = uc_pages.at(i).getKey("/Thumb");
-        thumb = getUncompressedObject(thumb, object_stream_data);
-        QPDFObjGen thumb_og(thumb.getObjGen());
         // Output the thumbnail itself
         append_vec(part9_, std::move(part9a_thumbnail_objects.at(i)));
         append_vec(part9_, std::move(part9b_thumbnail_private.at(i)));
