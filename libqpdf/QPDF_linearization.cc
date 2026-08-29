@@ -186,6 +186,7 @@ Lin::optimize_internal(
         // already optimized
         return;
     }
+    page_objs_.resize(m->pages.size());
 
     // The PDF specification indicates that /Outlines is supposed to be an indirect reference. Force
     // it to be so if it exists and is direct.  (This has been seen in the wild.)
@@ -253,22 +254,26 @@ Lin::optimize_internal(
     ObjUser root_ou = ObjUser(ObjUser::ou_root);
     auto root_og = root.id_gen();
     Lin::resolveCompressedObject(root_og, object_stream_data);
-    obj_categories_[root_og].update(root_ou.obj_category(true));
+    obj_categories_[root_og].update(root_ou, true);
 }
 
 void
-Lin::ObjCategory::update(ObjCategory const& other)
+Lin::ObjCategory::update(ObjUser const& other_ou, bool top)
 {
+    auto other = other_ou.obj_category(top);
     // Figure out what category this should be when combined with `other`. Earlier parts take
     // precedent over later parts. This logic is non-trivial for objects that are referenced from
     // more than one category. For example, if an object is referenced by the first page and the
     // root, it goes in the root category. If it's accessed from a non-first page and a first page,
     // it belongs in a first page category. This is only part of the logic. See remaining comments.
-    auto min_category = std::ranges::min(lin_category_, other.lin_category_);
-    auto max_category = std::ranges::max(lin_category_, other.lin_category_);
+    auto min_category = std::min(lin_category_, other.lin_category_);
+    auto max_category = std::max(lin_category_, other.lin_category_);
     auto this_pageno = pageno_;
     pageno_ = std::max(pageno_, other.pageno_);
-
+    if (!shared_ && last_ou_.has_value()) {
+        shared_ = last_ou_.value() != other_ou;
+    }
+    last_ou_ = other_ou;
     if (min_category <= c_first_page_shared) {
         // If either item is in part 4 or known to be referenced from the first page and at least
         // one other page, keep it in the highest priority of the values.
@@ -353,7 +358,10 @@ Lin::updateObjectMaps(
             if (cur.ou.ou_type == ObjUser::ou_root_key && cur.ou.key == "/Outlines") {
                 outlines_max_end_ = std::max(outlines_max_end_, m->obj_cache[og].end_after_space);
             }
-            obj_categories_[og].update(cur.ou.obj_category(cur.top));
+            obj_categories_[og].update(cur.ou, cur.top);
+            if (cur.ou.ou_type == ObjUser::ou_page) {
+                page_objs_.at(cur.ou.pageno).insert(og.getObj());
+            }
         }
 
         if (cur.oh.isArray()) {
@@ -1414,6 +1422,7 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     // running calculateLinearizationData() on a linearized file should give results identical to
     // the original file ordering.
 
+    std::set<QPDFObjGen> shared_ogs;
     for (auto& [og, category]: obj_categories_) {
         auto oh = qpdf.getObject(og);
         switch (category.category()) {
@@ -1472,14 +1481,9 @@ Lin::calculateLinearizationData(T const& object_stream_data)
             part9e_other.emplace_back(oh);
             break;
         }
-    }
-
-    std::set<QPDFObjGen> shared_ogs;
-    for (auto const& oh: part6b_first_page_shared) {
-        shared_ogs.insert(oh.getObjGen());
-    }
-    for (auto const& oh: part8_) {
-        shared_ogs.insert(oh.getObjGen());
+        if (category.shared()) {
+            shared_ogs.insert(og);
+        }
     }
 
     if (!part_outlines.empty()) {
@@ -1637,7 +1641,8 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     for (size_t i = 1; i < npages; ++i) {
         CHPageOffsetEntry& pe = c_page_offset_data_.entries.at(i);
         for (auto const& og: shared_ogs) {
-            if (obj_to_index.contains(og.getObj())) {
+            auto obj = og.getObj();
+            if (obj_to_index.contains(obj) && page_objs_.at(i).contains(obj)) {
                 int idx = obj_to_index[og.getObj()];
                 ++pe.nshared_objects;
                 pe.shared_identifiers.push_back(idx);

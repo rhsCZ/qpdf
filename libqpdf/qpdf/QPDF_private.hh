@@ -16,6 +16,7 @@
 
 #include <cinttypes>
 #include <exception>
+#include <optional>
 
 using namespace qpdf;
 
@@ -672,6 +673,7 @@ class QPDF::Doc::Linearization: Common
         enum user_e { ou_page = 1, ou_thumb, ou_trailer_key, ou_root_key, ou_root };
 
         ObjUser() = delete;
+        bool operator==(ObjUser const&) const = default;
 
         // type must be ou_root
         ObjUser(user_e type);
@@ -712,7 +714,7 @@ class QPDF::Doc::Linearization: Common
         /// object number.
         ///
         /// @param ou  The ObjUser indicating the user and context that referenced the object.
-        void update(ObjCategory const& other);
+        void update(ObjUser const& other_ou, bool top);
         ObjCategory() = default;
         ObjCategory(obj_category_e category, int pageno) :
             lin_category_(category),
@@ -730,6 +732,11 @@ class QPDF::Doc::Linearization: Common
         {
             return pageno_;
         }
+        inline bool
+        shared() const
+        {
+            return shared_;
+        }
 
       private:
         obj_category_e lin_category_{c_other};
@@ -739,6 +746,8 @@ class QPDF::Doc::Linearization: Common
         // at least one value so we can tell the difference between objects that are private to a
         // page and objects that are shared by multiple pages.
         int pageno_{-1};
+        bool shared_{false};
+        std::optional<ObjUser> last_ou_;
     };
 
     // PDF 1.4: Table F.4
@@ -924,6 +933,7 @@ class QPDF::Doc::Linearization: Common
 
     qpdf_offset_t outlines_max_end_{0};
     std::map<QPDFObjGen, ObjCategory> obj_categories_;
+    std::vector<std::set<int>> page_objs_;
 
     // Linearization data
     bool linearization_warnings_{false}; // set by linearizationWarning, used by checkLinearization
