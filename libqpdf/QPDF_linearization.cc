@@ -182,7 +182,7 @@ Lin::optimize_internal(
     bool allow_changes,
     std::function<int(QPDFObjectHandle&)> skip_stream_parameters)
 {
-    if (!obj_user_to_objects_.empty()) {
+    if (!obj_categories_.empty()) {
         // already optimized
         return;
     }
@@ -253,7 +253,6 @@ Lin::optimize_internal(
     ObjUser root_ou = ObjUser(ObjUser::ou_root);
     auto root_og = root.id_gen();
     Lin::resolveCompressedObject(root_og, object_stream_data);
-    obj_user_to_objects_[root_ou].insert(root_og);
     obj_categories_[root_og].update(root_ou.obj_category(true));
 }
 
@@ -350,11 +349,8 @@ Lin::updateObjectMaps(
                 continue;
             }
             Lin::resolveCompressedObject(og, object_stream_data);
-            if (cur.ou.ou_type == ObjUser::ou_page || cur.ou.ou_type == ObjUser::ou_thumb ||
-                (cur.ou.ou_type == ObjUser::ou_root_key &&
-                 (cur.ou.key == "/Pages" || cur.ou.key == "/Outlines"))) {
-                // QXXXQ Do I even need obj_user_to_objects_?
-                obj_user_to_objects_[cur.ou].insert(og);
+            if (cur.ou.ou_type == ObjUser::ou_root_key && cur.ou.key == "/Outlines") {
+                outlines_max_end_  = std::max(outlines_max_end_, m->obj_cache[og].end_after_space);
             }
             obj_categories_[og].update(cur.ou.obj_category(cur.top));
         }
@@ -849,24 +845,6 @@ Lin::checkLinearizationInternal()
 }
 
 qpdf_offset_t
-Lin::maxEnd(ObjUser const& ou)
-{
-    no_ci_stop_if(
-        !obj_user_to_objects_.contains(ou),
-        "no entry in object user table for requested object user" //
-    );
-
-    qpdf_offset_t end = 0;
-    for (auto const& og: obj_user_to_objects_[ou]) {
-        no_ci_stop_if(
-            !m->obj_cache.contains(og), "unknown object referenced in object user table" //
-        );
-        end = std::max(end, m->obj_cache[og].end_after_space);
-    }
-    return end;
-}
-
-qpdf_offset_t
 Lin::getLinearizationOffset(QPDFObjGen og, bool require_type_1)
 {
     QPDFXRefEntry const& entry = m->xref_table[og];
@@ -1133,7 +1111,7 @@ Lin::checkHOutlines()
             );
             qpdf_offset_t offset = getLinearizationOffset(og);
             ObjUser ou(ObjUser::ou_root_key, "/Outlines");
-            int length = toI(maxEnd(ou) - offset);
+            int length = toI(outlines_max_end_ - offset);
             qpdf_offset_t table_offset = adjusted_offset(outline_hints_.first_object_offset);
             if (offset != table_offset) {
                 linearizationWarning(

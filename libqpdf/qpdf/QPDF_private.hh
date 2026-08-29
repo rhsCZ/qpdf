@@ -879,7 +879,6 @@ class QPDF::Doc::Linearization: Common
     void readHPageOffset(BitStream);
     void readHSharedObject(BitStream);
     void readHGeneric(BitStream, HGeneric&);
-    qpdf_offset_t maxEnd(ObjUser const& ou);
     qpdf_offset_t getLinearizationOffset(QPDFObjGen, bool require_type_1 = false);
     QPDFObjectHandle
     getUncompressedObject(QPDFObjectHandle&, std::map<int, int> const& object_stream_data);
@@ -918,10 +917,12 @@ class QPDF::Doc::Linearization: Common
         QPDFObjectHandle oh,
         T& object_stream_data,
         std::function<int(QPDFObjectHandle&)> skip_stream_parameters);
-    static void resolveCompressedObject(QPDFObjGen& og, std::map<int, int> const& object_stream_data);
-    static void resolveCompressedObject(QPDFObjGen& og, QPDFWriter::ObjTable const& object_stream_data);
+    static void
+    resolveCompressedObject(QPDFObjGen& og, std::map<int, int> const& object_stream_data);
+    static void
+    resolveCompressedObject(QPDFObjGen& og, QPDFWriter::ObjTable const& object_stream_data);
 
-    std::map<ObjUser, std::set<QPDFObjGen>> obj_user_to_objects_;
+    qpdf_offset_t outlines_max_end_{0};
     std::map<QPDFObjGen, ObjCategory> obj_categories_;
 
     // Linearization data
