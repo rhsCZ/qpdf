@@ -653,6 +653,7 @@ class QPDF::Doc::Linearization: Common
     enum obj_category_e {
         c_root,
         c_open_document,
+        c_pages_obj,
         c_first_page_shared,
         c_first_page_private,
         c_other_page_shared,
@@ -661,7 +662,6 @@ class QPDF::Doc::Linearization: Common
         c_thumbnail_private,
         c_outlines_obj,
         c_outlines,
-        c_pages_obj,
         c_other,
     };
 

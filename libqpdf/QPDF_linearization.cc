@@ -353,6 +353,9 @@ Lin::updateObjectMaps(
                 continue;
             }
         }
+        if (first_ou.ou_type == ObjUser::ou_page && cur.oh.isDictionaryOfType("/Pages")) {
+            continue;
+        }
 
         if (cur.oh.indirect()) {
             QPDFObjGen og(cur.oh.getObjGen());
