@@ -209,7 +209,8 @@ Lin::optimize_internal(
     int last_pct = -1;
     size_t n = 0;
     for (auto const& page: m->pages) {
-        updateObjectMaps(ObjUser(ObjUser::ou_page, n), page, skip_stream_parameters);
+        updateObjectMaps(
+            ObjUser(ObjUser::ou_page, n), page, object_stream_data, skip_stream_parameters);
         ++n;
         if (progress_callback_ && total > 0) {
             int pct = static_cast<int>((100ULL * n) / total);
@@ -227,7 +228,10 @@ Lin::optimize_internal(
         } else {
             if (!value.null()) {
                 updateObjectMaps(
-                    ObjUser(ObjUser::ou_trailer_key, key), value, skip_stream_parameters);
+                    ObjUser(ObjUser::ou_trailer_key, key),
+                    value,
+                    object_stream_data,
+                    skip_stream_parameters);
             }
         }
     }
@@ -238,22 +242,19 @@ Lin::optimize_internal(
         // pdlin and Acrobat both disregard things like this from time to time, so this is almost
         // certain not to cause any problems.
         if (!value.null()) {
-            updateObjectMaps(ObjUser(ObjUser::ou_root_key, key), value, skip_stream_parameters);
+            updateObjectMaps(
+                ObjUser(ObjUser::ou_root_key, key),
+                value,
+                object_stream_data,
+                skip_stream_parameters);
         }
     }
 
     ObjUser root_ou = ObjUser(ObjUser::ou_root);
     auto root_og = root.id_gen();
-    obj_user_to_objects_[root_ou].push_back(root_og);
+    Lin::resolveCompressedObject(root_og, object_stream_data);
+    obj_user_to_objects_[root_ou].insert(root_og);
     obj_categories_[root_og].update(root_ou.obj_category(true));
-
-    // Sort each collection by ObjGen to ensure a deterministic order when we iterate through these
-    // for final object categorization.
-    for (auto& [ou, ogs]: obj_user_to_objects_) {
-        std::sort(ogs.begin(), ogs.end());
-    }
-
-    filterCompressedObjects(object_stream_data);
 }
 
 void
@@ -316,10 +317,12 @@ Lin::ObjCategory::update(ObjCategory const& other)
     lin_category_ = min_category;
 }
 
+template <typename T>
 void
 Lin::updateObjectMaps(
     ObjUser const& first_ou,
     QPDFObjectHandle first_oh,
+    T& object_stream_data,
     std::function<int(QPDFObjectHandle&)> skip_stream_parameters)
 {
     QPDFObjGen::set visited;
@@ -346,13 +349,13 @@ Lin::updateObjectMaps(
                 QTC::TC("qpdf", "QPDF opt loop detected");
                 continue;
             }
+            Lin::resolveCompressedObject(og, object_stream_data);
             if (cur.ou.ou_type == ObjUser::ou_page || cur.ou.ou_type == ObjUser::ou_thumb ||
                 (cur.ou.ou_type == ObjUser::ou_root_key &&
                  (cur.ou.key == "/Pages" || cur.ou.key == "/Outlines"))) {
                 // QXXXQ Do I even need obj_user_to_objects_?
-                obj_user_to_objects_[cur.ou].push_back(og);
+                obj_user_to_objects_[cur.ou].insert(og);
             }
-            // QXXXQ can we resolve the object's object stream owner here?
             obj_categories_[og].update(cur.ou.obj_category(cur.top));
         }
 
@@ -396,78 +399,19 @@ Lin::updateObjectMaps(
 }
 
 void
-Lin::filterCompressedObjects(std::map<int, int> const& object_stream_data)
+Lin::resolveCompressedObject(QPDFObjGen& og, std::map<int, int> const& object_stream_data)
 {
-    // QXXXQ can we eliminate this entirely by just working with the containing object stream
-    // when we build obj_user_to_objects_ and obj_categories_?
-    if (object_stream_data.empty()) {
-        return;
-    }
-
-    // Transform object_to_obj_users and obj_user_to_objects so that they refer only to uncompressed
-    // objects.  If something is a user of a compressed object, then it is really a user of the
-    // object stream that contains it.
-    for (auto& [ou, ogs]: obj_user_to_objects_) {
-        for (auto& og: ogs) {
-            auto i2 = object_stream_data.find(og.getObj());
-            if (i2 != object_stream_data.end()) {
-                og = QPDFObjGen(i2->second, 0);
-            }
-        }
-        std::sort(ogs.begin(), ogs.end());
-        ogs.erase(std::unique(ogs.begin(), ogs.end()), ogs.end());
-    }
-
-    // Make sure the object category for each object stream is the union of the categories of the
-    // objects in the stream. Then remove the compressed objects from the maps.
-    std::vector<QPDFObjGen> to_delete;
-    for (auto const& [og, category]: obj_categories_) {
-        auto i2 = object_stream_data.find(og.getObj());
-        if (i2 != object_stream_data.end()) {
-            QPDFObjGen target(i2->second, 0);
-            obj_categories_[target].update(category);
-            to_delete.emplace_back(og);
-        }
-    }
-    for (auto og: to_delete) {
-        obj_categories_.erase(og);
+    auto owner = object_stream_data.find(og.getObj());
+    if (owner != object_stream_data.end()) {
+        og = {owner->second, 0};
     }
 }
 
 void
-Lin::filterCompressedObjects(QPDFWriter::ObjTable const& obj)
+Lin::resolveCompressedObject(QPDFObjGen& og, QPDFWriter::ObjTable const& obj)
 {
-    // QXXXQ can we eliminate this entirely by just working with the containing object stream
-    // when we build obj_user_to_objects_ and obj_categories_?
-    if (obj.getStreamsEmpty()) {
-        return;
-    }
-    for (auto& [ou, ogs]: obj_user_to_objects_) {
-        for (auto& og: ogs) {
-            if (auto i2 = obj.contains(og) ? obj[og].object_stream : 0) {
-                og = QPDFObjGen(i2, 0);
-            }
-        }
-        std::sort(ogs.begin(), ogs.end());
-        ogs.erase(std::unique(ogs.begin(), ogs.end()), ogs.end());
-    }
-
-    std::vector<QPDFObjGen> to_delete;
-    for (auto const& [og, category]: obj_categories_) {
-        if (!obj.contains(og)) {
-            continue;
-        }
-        auto i2 = obj[og].object_stream;
-        if (i2 > 0) {
-            QPDFObjGen target(i2, 0);
-            if (target != og) {
-                obj_categories_[target].update(category);
-                to_delete.emplace_back(og);
-            }
-        }
-    }
-    for (auto og: to_delete) {
-        obj_categories_.erase(og);
+    if (auto owner = obj.contains(og) ? obj[og].object_stream : 0) {
+        og = {owner, 0};
     }
 }
 

@@ -912,14 +912,16 @@ class QPDF::Doc::Linearization: Common
 
     // Methods to support optimization
 
+    template <typename T>
     void updateObjectMaps(
         ObjUser const& ou,
         QPDFObjectHandle oh,
+        T& object_stream_data,
         std::function<int(QPDFObjectHandle&)> skip_stream_parameters);
-    void filterCompressedObjects(std::map<int, int> const& object_stream_data);
-    void filterCompressedObjects(QPDFWriter::ObjTable const& object_stream_data);
+    static void resolveCompressedObject(QPDFObjGen& og, std::map<int, int> const& object_stream_data);
+    static void resolveCompressedObject(QPDFObjGen& og, QPDFWriter::ObjTable const& object_stream_data);
 
-    std::map<ObjUser, std::vector<QPDFObjGen>> obj_user_to_objects_;
+    std::map<ObjUser, std::set<QPDFObjGen>> obj_user_to_objects_;
     std::map<QPDFObjGen, ObjCategory> obj_categories_;
 
     // Linearization data
