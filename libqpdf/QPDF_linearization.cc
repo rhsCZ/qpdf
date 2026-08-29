@@ -269,7 +269,13 @@ Lin::ObjCategory::update(ObjUser const& other_ou, bool top)
     auto min_category = std::min(lin_category_, other.lin_category_);
     auto max_category = std::max(lin_category_, other.lin_category_);
     auto this_pageno = pageno_;
-    pageno_ = std::max(pageno_, other.pageno_);
+    if (this_pageno == -1 || other.pageno_ == -1) {
+        pageno_ = std::max(pageno_, other.pageno_);
+    } else {
+        // If an object is referenced by more than one page, count it as being on the first one
+        // for purposes of placement.
+        pageno_ = std::min(pageno_, other.pageno_);
+    }
     if (!shared_ && last_ou_.has_value()) {
         shared_ = last_ou_.value() != other_ou;
     }
@@ -297,8 +303,7 @@ Lin::ObjCategory::update(ObjUser const& other_ou, bool top)
     }
     if (min_category == c_other_page_private) {
         if (max_category == c_other_page_private && this_pageno != other.pageno_) {
-            // This is now known to be referenced from multiple pages. The value of pageno_
-            // no longer matters as long as it's >= 0.
+            // This is now known to be referenced from multiple pages.
             lin_category_ = c_other_page_shared;
         } else {
             lin_category_ = c_other_page_private;
