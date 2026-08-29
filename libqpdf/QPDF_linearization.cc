@@ -1655,15 +1655,8 @@ Lin::calculateLinearizationData(T const& object_stream_data)
     );
 
     // Now compute the list of shared objects for each page after the first page.
-
     for (size_t i = 1; i < npages; ++i) {
         CHPageOffsetEntry& pe = c_page_offset_data_.entries.at(i);
-        ObjUser ou(ObjUser::ou_page, i);
-        no_ci_stop_if(
-            !obj_user_to_objects_.contains(ou),
-            "found unreferenced page while calculating linearization data" //
-        );
-
         for (auto const& og: shared_ogs) {
             if (obj_to_index.contains(og.getObj())) {
                 int idx = obj_to_index[og.getObj()];
