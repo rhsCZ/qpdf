@@ -266,6 +266,9 @@ Lin::ObjCategory::update(ObjCategory const& other)
     // it belongs in a first page category. This is only part of the logic. See remaining comments.
     auto min_category = std::ranges::min(lin_category_, other.lin_category_);
     auto max_category = std::ranges::max(lin_category_, other.lin_category_);
+    auto this_pageno = pageno_;
+    pageno_ = std::max(pageno_, other.pageno_);
+
     if (min_category <= c_first_page_shared) {
         // If either item is in part 4 or known to be referenced from the first page and at least
         // one other page, keep it in the highest priority of the values.
@@ -288,13 +291,12 @@ Lin::ObjCategory::update(ObjCategory const& other)
         return;
     }
     if (min_category == c_other_page_private) {
-        if (max_category == c_other_page_private && pageno_ != other.pageno_) {
+        if (max_category == c_other_page_private && this_pageno != other.pageno_) {
             // This is now known to be referenced from multiple pages. The value of pageno_
-            // no longer matters.
+            // no longer matters as long as it's >= 0.
             lin_category_ = c_other_page_shared;
         } else {
             lin_category_ = c_other_page_private;
-            pageno_ = other.pageno_;
         }
         return;
     }
@@ -304,11 +306,10 @@ Lin::ObjCategory::update(ObjCategory const& other)
         return;
     }
     if (min_category == c_thumbnail_private) {
-        if (max_category == c_thumbnail_private && pageno_ != other.pageno_) {
+        if (max_category == c_thumbnail_private && this_pageno != other.pageno_) {
             lin_category_ = c_thumbnail_shared;
         } else {
             lin_category_ = c_thumbnail_private;
-            pageno_ = other.pageno_;
         }
         return;
     }
@@ -350,7 +351,7 @@ Lin::updateObjectMaps(
             }
             Lin::resolveCompressedObject(og, object_stream_data);
             if (cur.ou.ou_type == ObjUser::ou_root_key && cur.ou.key == "/Outlines") {
-                outlines_max_end_  = std::max(outlines_max_end_, m->obj_cache[og].end_after_space);
+                outlines_max_end_ = std::max(outlines_max_end_, m->obj_cache[og].end_after_space);
             }
             obj_categories_[og].update(cur.ou.obj_category(cur.top));
         }
