@@ -276,10 +276,6 @@ Lin::ObjCategory::update(ObjUser const& other_ou, bool top)
         // for purposes of placement.
         pageno_ = std::min(this_pageno, other.pageno_);
     }
-    if (!shared_ && last_ou_.has_value()) {
-        shared_ = last_ou_.value() != other_ou;
-    }
-    last_ou_ = other_ou;
     if (min_category <= c_first_page_shared) {
         // If either item is in part 4 or known to be referenced from the first page and at least
         // one other page, keep it in the highest priority of the values. This also preserves
@@ -1440,6 +1436,7 @@ Lin::calculateLinearizationData(T const& object_stream_data)
             part4a_open_document.emplace_back(oh);
             break;
         case c_first_page_shared:
+            shared_ogs.insert(oh.getObjGen());
             part6b_first_page_shared.emplace_back(oh);
             break;
         case c_first_page_private:
@@ -1451,6 +1448,7 @@ Lin::calculateLinearizationData(T const& object_stream_data)
             }
             break;
         case c_other_page_shared:
+            shared_ogs.insert(oh.getObjGen());
             part8_.emplace_back(oh);
             break;
         case c_other_page_private:
@@ -1490,9 +1488,6 @@ Lin::calculateLinearizationData(T const& object_stream_data)
         case c_other:
             part9e_other.emplace_back(oh);
             break;
-        }
-        if (category.shared()) {
-            shared_ogs.insert(og);
         }
     }
 

@@ -732,11 +732,6 @@ class QPDF::Doc::Linearization: Common
         {
             return pageno_;
         }
-        inline bool
-        shared() const
-        {
-            return shared_;
-        }
 
       private:
         obj_category_e lin_category_{c_other};
@@ -746,8 +741,6 @@ class QPDF::Doc::Linearization: Common
         // at least one value so we can tell the difference between objects that are private to a
         // page and objects that are shared by multiple pages.
         int pageno_{-1};
-        bool shared_{false};
-        std::optional<ObjUser> last_ou_;
     };
 
     // PDF 1.4: Table F.4
