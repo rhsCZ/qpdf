@@ -13,6 +13,10 @@ more detail.
 
 .. x.y.z: not yet released
 
+12.4.2: not yet released
+  - Enhancements
+    - In --show-linearization, including a listing of all the object numbers assigned to each part.
+
 12.4.1: August 27, 2026
   - Bug fixes
 

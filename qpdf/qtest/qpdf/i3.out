@@ -232,4 +232,17 @@ Shared Object 36:
   group length: 58
 Shared Object 37:
   group length: 55
+
+Part Contents
+
+Objects in part 4 (root, document open):
+ 4 6
+Objects in part 6 (first page):
+ 5 7 8 9 10 11 12 13 14 15 16 17 18 19 20
+ 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35
+ 36 37 38 39 40 41 42 43
+Objects in part 7 (other pages, private): none
+Objects in part 8 (other pages, shared): none
+Objects in part 9 (everything else):
+ 2 1
 qpdf: operation succeeded with warnings

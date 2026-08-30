@@ -1307,6 +1307,33 @@ Lin::dumpLinearizationDataInternal()
         info << "\nOutlines Hint Table\n\n";
         dumpHGeneric(outline_hints_);
     }
+
+    info << "\nPart Contents\n\n";
+    dumpPart("4 (root, document open)", part4_);
+    dumpPart("6 (first page)", part6_);
+    dumpPart("7 (other pages, private)", part7_);
+    dumpPart("8 (other pages, shared)", part8_);
+    dumpPart("9 (everything else)", part9_);
+}
+
+void
+Lin::dumpPart(std::string_view label, std::vector<QPDFObjectHandle> const& part)
+{
+    auto& info = *cf.log()->getInfo();
+    info << "Objects in part " << std::string(label) << ":";
+    size_t n = 0;
+    for (auto const& oh: part) {
+        if (n % 15 == 0) {
+            info << "\n";
+        }
+        ++n;
+        info << " " << oh.getObjectID();
+    }
+    if (n == 0) {
+        info << " none\n";
+    } else {
+        info << "\n";
+    }
 }
 
 qpdf_offset_t

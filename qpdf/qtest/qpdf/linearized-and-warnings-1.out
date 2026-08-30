@@ -49,4 +49,15 @@ Shared Object 2:
   group length: 30
 Shared Object 3:
   group length: 107
+
+Part Contents
+
+Objects in part 4 (root, document open):
+ 4
+Objects in part 6 (first page):
+ 6 7 8 9
+Objects in part 7 (other pages, private): none
+Objects in part 8 (other pages, shared): none
+Objects in part 9 (everything else):
+ 1
 test 12 done
