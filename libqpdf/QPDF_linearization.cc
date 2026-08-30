@@ -186,7 +186,6 @@ Lin::optimize_internal(
         // already optimized
         return;
     }
-    page_objs_.resize(m->pages.size());
 
     // The PDF specification indicates that /Outlines is supposed to be an indirect reference. Force
     // it to be so if it exists and is direct.  (This has been seen in the wild.)
@@ -207,6 +206,7 @@ Lin::optimize_internal(
     // we report progress through this operation when a callback is registered. Throttle to one
     // event per integer-percent change to minimize overhead.
     size_t const total = m->pages.size();
+    page_objs_.resize(total);
     int last_pct = -1;
     size_t n = 0;
     for (auto const& page: m->pages) {
