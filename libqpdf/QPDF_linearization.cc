@@ -282,7 +282,8 @@ Lin::ObjCategory::update(ObjUser const& other_ou, bool top)
     last_ou_ = other_ou;
     if (min_category <= c_first_page_shared) {
         // If either item is in part 4 or known to be referenced from the first page and at least
-        // one other page, keep it in the highest priority of the values.
+        // one other page, keep it in the highest priority of the values. This also preserves
+        // outlines.
         lin_category_ = min_category;
         return;
     }
@@ -364,9 +365,6 @@ Lin::updateObjectMaps(
                 continue;
             }
             Lin::resolveCompressedObject(og, object_stream_data);
-            if (cur.ou.ou_type == ObjUser::ou_root_key && cur.ou.key == "/Outlines") {
-                outlines_max_end_ = std::max(outlines_max_end_, m->obj_cache[og].end_after_space);
-            }
             obj_categories_[og].update(cur.ou, cur.top);
             if (cur.ou.ou_type == ObjUser::ou_page) {
                 page_objs_.at(cur.ou.pageno).insert(og.getObj());
@@ -1480,9 +1478,11 @@ Lin::calculateLinearizationData(T const& object_stream_data)
             break;
         case c_outlines_obj:
             part_outlines_obj.emplace_back(oh);
+            outlines_max_end_ = std::max(outlines_max_end_, m->obj_cache[og].end_after_space);
             break;
         case c_outlines:
             part_outlines.emplace_back(oh);
+            outlines_max_end_ = std::max(outlines_max_end_, m->obj_cache[og].end_after_space);
             break;
         case c_pages_obj:
             part9_.emplace_back(oh);
